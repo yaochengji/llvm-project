@@ -18,6 +18,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include <queue>
+#include <unordered_set>
 #include <vector>
 
 #define DEBUG_TYPE "outline-shape-computation"
@@ -26,6 +27,8 @@ using namespace mlir;
 
 namespace {
 
+// A Value is an input of the cluster if it is an operand of an operation in the
+// cluster and its defining operation is not in the cluster.
 SmallVector<Value, 4>
 getInputsOfCluster(const llvm::SmallVector<Operation *, 8> &cluster) {
   SmallVector<Value, 4> inputs;
@@ -52,18 +55,20 @@ getInputsOfCluster(const llvm::SmallVector<Operation *, 8> &cluster) {
   return inputs;
 }
 
+// Create a shape.func representing the shape computation for \p dimSize.
 std::pair<shape::FuncOp, SmallVector<Value>>
 createFuncFromCluster(OpBuilder &b, const SmallVector<Operation *, 8> &cluster,
                       Value dimSize, StringRef fnName) {
-  SmallVector<Value, 4> inputs = getInputsOfCluster(cluster);
-  SmallVector<Type, 1> output_types{dimSize.getType()};
-
-  SmallVector<Type, 4> input_types;
-  input_types.reserve(inputs.size());
-  for (Value v : inputs) {
-    input_types.push_back(v.getType());
+  if (cluster.size() == 0) {
+    llvm_unreachable("There must be at least one element in the cluster.");
   }
-  auto fnType = b.getFunctionType(input_types, output_types);
+
+  SmallVector<Value, 4> inputs = getInputsOfCluster(cluster);
+  SmallVector<Type, 1> outputTypes{dimSize.getType()};
+  SmallVector<Type, 4> inputTypes = llvm::to_vector(
+      llvm::map_range(inputs, [](Value inp) { return inp.getType(); }));
+
+  auto fnType = b.getFunctionType(inputTypes, outputTypes);
   b.setInsertionPointAfter(cluster[0]->getParentOp());
   shape::FuncOp fnOp =
       b.create<shape::FuncOp>(UnknownLoc::get(b.getContext()), fnName, fnType);
@@ -84,9 +89,11 @@ createFuncFromCluster(OpBuilder &b, const SmallVector<Operation *, 8> &cluster,
   return std::make_pair(fnOp, inputs);
 }
 
+// The operations in the cluster might be unsorted, which could be inconvinient
+// when creating shape.func op.
 DenseMap<Value, SmallVector<Operation *, 8>>
 getOrderedClusters(const DenseMap<Value, DenseSet<Operation *>> &clusters,
-                   ModuleOp &moduleOp) {
+                   func::FuncOp funcOp) {
   DenseMap<Operation *, SmallVector<Value>> op2Shapes;
   for (auto it : clusters) {
     Value shape = it.first;
@@ -97,7 +104,7 @@ getOrderedClusters(const DenseMap<Value, DenseSet<Operation *>> &clusters,
   }
 
   DenseMap<Value, SmallVector<Operation *, 8>> orderedClusters;
-  moduleOp.walk([&](Operation *op) {
+  funcOp.walk([&](Operation *op) {
     auto it = op2Shapes.find(op);
     if (it != op2Shapes.end()) {
       Operation *cOp = it->first;
@@ -110,171 +117,214 @@ getOrderedClusters(const DenseMap<Value, DenseSet<Operation *>> &clusters,
   return orderedClusters;
 }
 
-bool isDimOpNotFromFuncArg(Value dimSize) {
-  tensor::DimOp dimOp = dimSize.getDefiningOp<tensor::DimOp>();
-  assert(dimOp != nullptr &&
-         "input of the cluster is supposed to be a tensor.dim op");
-  Value source = dimOp.getSource();
-  return source.getDefiningOp();
-}
+void initFuncArgs(func::FuncOp funcOp,
+                  std::unordered_set<std::string> &usedSymbolNames) {
+  for (Value arg : funcOp.getArguments()) {
+    auto rankedType = arg.getType().dyn_cast<RankedTensorType>();
+    if (rankedType != nullptr) {
+      auto encoding = rankedType.getEncoding().dyn_cast_or_null<ArrayAttr>();
+      if (encoding != nullptr) {
+        SmallVector<FlatSymbolRefAttr> symbols;
+        for (Attribute attr : encoding) {
+          if (auto symbolAttr = attr.dyn_cast<FlatSymbolRefAttr>()) {
+            usedSymbolNames.insert(symbolAttr.getValue().str());
+            symbols.push_back(symbolAttr);
+          }
+        }
 
-std::pair<unsigned, unsigned> getArgAndDimPos(Value dimSize) {
-  tensor::DimOp dimOp = dimSize.getDefiningOp<tensor::DimOp>();
-  assert(dimOp != nullptr &&
-         "input of the cluster is supposed to be a tensor.dim op");
-  Value source = dimOp.getSource();
-  func::FuncOp funcOp = dimOp->getParentOfType<func::FuncOp>();
-
-  unsigned argPos = 0;
-  APInt dimPos;
-
-  for (unsigned i = 0; i < funcOp.getNumArguments(); ++i) {
-    if (funcOp.getArgument(i) == source) {
-      argPos = i;
-      break;
+      //   for (Operation *user : arg.getUsers()) {
+      //     if (llvm::isa<shape::ShapeOfOp>(user)) {
+      //       for (Operation *extentUser : user->getUsers()) {
+      //         if (auto extentOp =
+      //                 llvm::dyn_cast<shape::GetExtentOp>(extentUser)) {
+      //           APInt dimPos;
+      //           if (!matchPattern(extentOp.getDim(), m_ConstantInt(&dimPos))) {
+      //             llvm_unreachable(
+      //                 "The dim value of shape.get_extent is not constant-like");
+      //           }
+      //         }
+      //       }
+      //     }
+      //   }
+      // }
     }
   }
+}
 
-  if (!matchPattern(dimOp.getIndex(), m_ConstantInt(&dimPos))) {
-    llvm_unreachable("The index of tensor.dim is not constant-like");
+// Increment \p idx until find the next available symbol name
+std::string
+getNextAvailableSymbolName(const std::string &prefix, int &idx,
+                           std::unordered_set<std::string> &usedSymbolNames) {
+  std::string name = prefix + std::to_string(idx++);
+
+  while (usedSymbolNames.count(name)) {
+    name = prefix + std::to_string(idx++);
   }
+  usedSymbolNames.insert(name);
+  return name;
+}
 
-  return {argPos, dimPos.getZExtValue()};
+void constructShapeFunc(const std::vector<shape::WithOp> &allWithOps,
+                        MLIRContext *context,
+                        std::unordered_set<std::string> &usedSymbolNames,
+                        DenseMap<Value, SmallVector<Operation *, 8>> &clusters,
+                        SymbolTable &symbolTable) {
+  DenseMap<Value, FlatSymbolRefAttr> dynDimSrc2Symbol;
+  std::string dynamicSourceNamePrefix = "s";
+  int dynamicSourceNameIdx = 0;
+  std::string shapeCalculationNamePrefix = "shape_cal_";
+  int shapeCalculationNameIdx = 0;
+  OpBuilder builder(context);
+
+  auto getOrConstructSymbolFromDimSize = [&](Value dimSize) {
+    auto symbolIt = dynDimSrc2Symbol.find(dimSize);
+    if (symbolIt == dynDimSrc2Symbol.end()) {
+      // FIXME: handle func arg
+      std::string name = getNextAvailableSymbolName(
+          dynamicSourceNamePrefix, dynamicSourceNameIdx, usedSymbolNames);
+      auto symbol = FlatSymbolRefAttr::get(context, name);
+      dynDimSrc2Symbol[dimSize] = symbol;
+      return symbol;
+    } else {
+      return symbolIt->second;
+    }
+  };
+
+  // Construct a shape function or a symbol for each cluster
+  for (shape::WithOp withOp : allWithOps) {
+    Value value = withOp.getOperand();
+    Value shape = withOp.getShape();
+    RankedTensorType rankedType = value.getType().dyn_cast<RankedTensorType>();
+    if (rankedType == nullptr) {
+      continue;
+    }
+    SmallVector<FlatSymbolRefAttr> symbols;
+
+    // FIXME: handle the case that shape is not constructed from
+    // shape.from_extents
+    SmallVector<Attribute> arrayAttr;
+    if (auto fromExtentsOp = shape.getDefiningOp<shape::FromExtentsOp>()) {
+      for (auto it : llvm::enumerate(fromExtentsOp.getExtents())) {
+        size_t idx = it.index();
+        if (!rankedType.isDynamicDim(idx))
+          continue;
+        SmallVector<Attribute> symbols;
+        Value dimSize = it.value();
+        const SmallVector<Operation *, 8> &cluster = clusters[dimSize];
+        // The cluster is empty if the dimension is from internal dynamic
+        // dimension source or a function argument
+        if (cluster.empty()) {
+          FlatSymbolRefAttr symbol = getOrConstructSymbolFromDimSize(dimSize);
+          symbols.push_back(symbol);
+          LLVM_DEBUG(llvm::dbgs()
+                     << "Symbol for " << dimSize << ": " << symbol << "\n");
+        } else {
+          std::string name = getNextAvailableSymbolName(
+              shapeCalculationNamePrefix, shapeCalculationNameIdx,
+              usedSymbolNames);
+          auto pair = createFuncFromCluster(builder, cluster, dimSize, name);
+          shape::FuncOp shapeFuncOp = pair.first;
+          StringAttr insertedName = symbolTable.insert(shapeFuncOp);
+          auto symbol = FlatSymbolRefAttr::get(context, insertedName);
+          const SmallVector<Value> &inputs = pair.second;
+          symbols.push_back(symbol);
+          for (Value inp : inputs) {
+            FlatSymbolRefAttr argSymbol = getOrConstructSymbolFromDimSize(inp);
+            symbols.push_back(argSymbol);
+          }
+          arrayAttr.push_back(ArrayAttr::get(context, symbols));
+          LLVM_DEBUG(llvm::dbgs()
+                     << "Symbol for " << dimSize << ": " << arrayAttr.back());
+        }
+      }
+    }
+
+    value.setType(RankedTensorType::get(rankedType.getShape(),
+                                        rankedType.getElementType(),
+                                        ArrayAttr::get(context, arrayAttr)));
+  }
 }
 
 struct OutlineShapeComputationPass
     : public OutlineShapeComputationBase<OutlineShapeComputationPass> {
+
+  OutlineShapeComputationPass(const std::string &entryFunc)
+      : OutlineShapeComputationBase() {
+    this->entryFunc = entryFunc;
+  }
+
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
-    init(moduleOp);
     SymbolTable symbolTable(moduleOp);
-
     MLIRContext *context = moduleOp.getContext();
-    std::vector<shape::WithOp> allWithOps;
 
-    DenseMap<Value, DenseSet<Operation *>> clusters;
-    moduleOp.walk([&](shape::WithOp withOp) { allWithOps.push_back(withOp); });
-    std::string dynamicSourceNamePrefix = "s";
-    int dynamicSourceNameIdx = 0;
-    std::string shapeCalculationNamePrefix = "shape_cal_";
-    int shapeCalculationNameIdx = 0;
-    OpBuilder builder(context);
-    DenseMap<Value, FlatSymbolRefAttr> dynDimSize2Symbol;
-
-    auto getOrConstructSymbolFromDimSize = [&](Value dimSize) {
-      auto symbolIt = dynDimSize2Symbol.find(dimSize);
-      if (symbolIt == dynDimSize2Symbol.end()) {
-        std::string name;
-        if (isDimOpNotFromFuncArg(dimSize)) {
-          name =
-              dynamicSourceNamePrefix + std::to_string(dynamicSourceNameIdx++);
-        } else {
-          auto posPair = getArgAndDimPos(dimSize);
-          name = "arg_" + std::to_string(posPair.first) + "_dim_" +
-                 std::to_string(posPair.second);
-        }
-        auto symbol = FlatSymbolRefAttr::get(context, name);
-        dynDimSize2Symbol[dimSize] = symbol;
-        return symbol;
-      } else {
-        return symbolIt->second;
-      }
-    };
-
-    for (shape::WithOp withOp : allWithOps) {
-      Value shape = withOp.getShape();
-      // Get the operations cluster for each dimension size
-      // FIXME: handle the case that shape is not constructed from
-      // shape.from_extents
-      if (auto fromExtentsOp = shape.getDefiningOp<shape::FromExtentsOp>()) {
-        for (Value dimSize : fromExtentsOp.getExtents()) {
-          if (clusters.count(dimSize) == 0)
-            getClusterFromValue(dimSize, clusters);
-        }
-      }
-    }
-    DenseMap<Value, SmallVector<Operation *, 8>> orderedClusters =
-        getOrderedClusters(clusters, moduleOp);
-
-    // Construct a shape function or a symbol for each cluster
-    for (shape::WithOp withOp : allWithOps) {
-      Value value = withOp.getOperand();
-      SmallVector<FlatSymbolRefAttr> symbols;
-      Value shape = withOp.getShape();
-      RankedTensorType rankedType =
-          value.getType().dyn_cast<RankedTensorType>();
-      if (rankedType == nullptr) {
-        continue;
-      }
-
-      // FIXME: handle the case that shape is not constructed from
-      // shape.from_extents
-      if (auto fromExtentsOp = shape.getDefiningOp<shape::FromExtentsOp>()) {
-        for (auto it : llvm::enumerate(fromExtentsOp.getExtents())) {
-          size_t idx = it.index();
-          if (!rankedType.isDynamicDim(idx))
-            continue;
-          Value dimSize = it.value();
-          const SmallVector<Operation *, 8> &cluster = orderedClusters[dimSize];
-          // The cluster is empty if the dimension an internal dynamic dimension
-          // source or a function argument
-          if (cluster.empty()) {
-            FlatSymbolRefAttr symbol = getOrConstructSymbolFromDimSize(dimSize);
-            symbols.push_back(symbol);
-            LLVM_DEBUG(llvm::dbgs() << "Symbol for " << dimSize << "\n"
-                                    << symbol << "\n");
-          } else {
-            std::string name = shapeCalculationNamePrefix +
-                               std::to_string(shapeCalculationNameIdx++);
-            auto pair = createFuncFromCluster(builder, cluster, dimSize, name);
-            shape::FuncOp shapeFuncOp = pair.first;
-            StringAttr insertedName = symbolTable.insert(shapeFuncOp);
-            auto symbol = FlatSymbolRefAttr::get(context, insertedName);
-            const SmallVector<Value> &inputs = pair.second;
-            symbols.push_back(symbol);
-            for (Value inp : inputs) {
-              FlatSymbolRefAttr argSymbol =
-                  getOrConstructSymbolFromDimSize(inp);
-              symbols.push_back(argSymbol);
-            }
-            LLVM_DEBUG(llvm::dbgs() << "Symbol for " << dimSize << "\n";
-                       for (auto symbol
-                            : symbols) llvm::dbgs()
-                       << symbol << "\n";);
-          }
-        }
-      }
-
-      auto shapeInfo = shape::ExtShapeInfoAttr::get(context, symbols);
-      value.setType(RankedTensorType::get(
-          rankedType.getShape(), rankedType.getElementType(), shapeInfo));
-    }
-
-    // FIXME: fix nested call
     moduleOp.walk([&](func::FuncOp funcOp) {
-      funcOp.setType(
-          FunctionType::get(context, funcOp.front().getArgumentTypes(),
-                            funcOp.front().getTerminator()->getOperandTypes()));
+      if (funcOp.getName() != entryFunc)
+        return;
+
+      // initialize class member \p onlyUsedByWithShapes_
+      funcOp.walk(
+          [&](Operation *op) { calOnlyUsedByWithShapesRecursively(op); });
+
+      // collect all the shape.with_shape ops.
+      std::vector<shape::WithOp> allWithOps;
+      funcOp.walk([&](shape::WithOp withOp) { allWithOps.push_back(withOp); });
+
+      std::unordered_set<std::string> usedSymbolNames;
+      DenseMap<Value, FlatSymbolRefAttr> dynDimSrc2Symbol;
+      initFuncArgs(funcOp, usedSymbolNames);
+
+      DenseMap<Value, SmallVector<Operation *, 8>> clusters =
+          constructClustersForEachDimSize(allWithOps, funcOp);
+
+      // Here we assume shape.with_shape ops has no users
+      for (shape::WithOp withOp : allWithOps) {
+        if (withOp.use_empty())
+          withOp->erase();
+      }
+
+      // dce
+      if (failed(applyPatternsAndFoldGreedily(funcOp, {}))) {
+        return signalPassFailure();
+      }
     });
 
-    // FIXME: handle the users of shape.with_shape
-    for (shape::WithOp withOp : allWithOps) {
-      withOp->erase();
-    }
-
-    // dce
-    if (failed(applyPatternsAndFoldGreedily(moduleOp, {}))) {
-      return signalPassFailure();
-    }
+    // // FIXME: fix nested call
+    // moduleOp.walk([&](func::FuncOp funcOp) {
+    //   funcOp.setType(
+    //       FunctionType::get(context, funcOp.front().getArgumentTypes(),
+    //                         funcOp.front().getTerminator()->getOperandTypes()));
+    // });
   }
 
 private:
-  void init(ModuleOp op);
   bool calOnlyUsedByWithShapesRecursively(Operation *op);
   void getClusterFromValue(Value shape,
                            DenseMap<Value, DenseSet<Operation *>> &clusters);
+  DenseMap<Value, SmallVector<Operation *, 8>>
+  constructClustersForEachDimSize(const std::vector<shape::WithOp> &allWithOps,
+                                  func::FuncOp funcOp);
   DenseMap<Operation *, bool> onlyUsedByWithShapes_;
 };
+
+DenseMap<Value, SmallVector<Operation *, 8>>
+OutlineShapeComputationPass::constructClustersForEachDimSize(
+    const std::vector<shape::WithOp> &allWithOps, func::FuncOp funcOp) {
+  DenseMap<Value, DenseSet<Operation *>> clusters;
+  for (shape::WithOp withOp : allWithOps) {
+    Value shape = withOp.getShape();
+    // Get the operations cluster for each dimension size
+    // FIXME: handle the case that shape is not constructed from
+    // shape.from_extents
+    if (auto fromExtentsOp = shape.getDefiningOp<shape::FromExtentsOp>()) {
+      for (Value dimSize : fromExtentsOp.getExtents()) {
+        if (clusters.count(dimSize) == 0)
+          getClusterFromValue(dimSize, clusters);
+      }
+    }
+  }
+  return getOrderedClusters(clusters, funcOp);
+}
 
 void OutlineShapeComputationPass::getClusterFromValue(
     Value shape, DenseMap<Value, DenseSet<Operation *>> &clusters) {
@@ -313,6 +363,8 @@ void OutlineShapeComputationPass::getClusterFromValue(
   clusters[shape] = std::move(cluster);
 }
 
+// check if an operation is only used by shape.with_shape directly or
+// indirectly.
 bool OutlineShapeComputationPass::calOnlyUsedByWithShapesRecursively(
     Operation *op) {
   auto it = onlyUsedByWithShapes_.find(op);
@@ -338,13 +390,9 @@ bool OutlineShapeComputationPass::calOnlyUsedByWithShapesRecursively(
   return allUsers;
 }
 
-void OutlineShapeComputationPass::init(ModuleOp moduleOp) {
-  moduleOp.walk([&](Operation *op) { calOnlyUsedByWithShapesRecursively(op); });
-}
-
 } // namespace
 
 std::unique_ptr<OperationPass<ModuleOp>>
-mlir::createOutlineShapeComputationPass() {
-  return std::make_unique<OutlineShapeComputationPass>();
+mlir::createOutlineShapeComputationPass(const std::string &entryFunc) {
+  return std::make_unique<OutlineShapeComputationPass>(entryFunc);
 }
