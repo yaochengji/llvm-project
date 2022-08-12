@@ -259,16 +259,15 @@ void OutlineShapeComputationPass::runOnOperation() {
       return;
 
     MLIRContext *context = funcOp.getContext();
-    // RewritePatternSet prevPatterns(context);
-    // prevPatterns.insert<TensorDimOpRewriter>(context);
-    // if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(prevPatterns)))) {
-    //   return signalPassFailure();
-    // }
+    RewritePatternSet prevPatterns(context);
+    prevPatterns.insert<TensorDimOpRewriter>(context);
+    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(prevPatterns)))) {
+      return signalPassFailure();
+    }
 
     // initialize class member \p onlyUsedByWithShapes_
     onlyUsedByWithShapes_.clear();
-    funcOp.walk([&](Operation *op) { calOnlyUsedByWithShapesRecursively(op);
-    });
+    funcOp.walk([&](Operation *op) { calOnlyUsedByWithShapesRecursively(op); });
 
     // collect all the shape.with_shape ops.
     std::vector<shape::WithOp> allWithOps;
@@ -278,10 +277,13 @@ void OutlineShapeComputationPass::runOnOperation() {
         constructClustersForEachShape(allWithOps, funcOp);
     constructShapeFunc(allWithOps, context, clusters, symbolTable, funcOp);
 
-    // Here we assume shape.with_shape ops has no users
     for (shape::WithOp withOp : allWithOps) {
-      if (withOp.use_empty())
-        withOp->erase();
+      Value value = withOp.getOperand();
+      for (Operation *user : withOp.getResult().getUsers()) {
+        if (Value valueOf = llvm::dyn_cast<shape::ValueOfOp>(user)) {
+          valueOf.replaceAllUsesExcept(value, withOp);
+        }
+      }
     }
 
     // dce

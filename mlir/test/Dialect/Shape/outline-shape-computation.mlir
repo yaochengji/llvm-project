@@ -12,7 +12,8 @@ func.func @main(%arg0: tensor<?x4x?xf32>, %arg1: tensor<2x4x?xf32>) -> tensor<?x
   %4 = arith.addi %3, %c2 : index
   %5 = shape.from_extents %4, %c4, %1 : index, index, index
   %6 = shape.with_shape %2, %5 : tensor<?x4x?xf32>, !shape.shape
-  return %2 : tensor<?x4x?xf32>
+  %7 = shape.value_of %6 : !shape.value_shape -> tensor<?x4x?xf32>
+  return %7 : tensor<?x4x?xf32>
 }
 
 // CHECK-LABEL: func.func @main(%arg0: tensor<?x4x?xf32>, %arg1: tensor<2x4x?xf32>) -> tensor<?x4x?xf32, [@shape_cal_0, @arg_0]> {
