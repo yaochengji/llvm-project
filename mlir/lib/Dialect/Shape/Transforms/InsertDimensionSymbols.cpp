@@ -46,7 +46,7 @@ struct InsertDimensionSymbolsPass
             arg.getType().dyn_cast<RankedTensorType>();
         if (rankedType != nullptr && !rankedType.hasStaticShape()) {
           changed = true;
-          SmallVector<FlatSymbolRefAttr> symbols;
+          SmallVector<Attribute> symbols;
           for (unsigned i = 0; i < rankedType.getRank(); ++i) {
             if (rankedType.isDynamicDim(i)) {
               std::string name = dynamicSourceNamePrefix +
@@ -55,7 +55,7 @@ struct InsertDimensionSymbolsPass
               symbols.push_back(symbol);
             }
           }
-          auto shapeInfo = shape::ExtShapeInfoAttr::get(context, symbols);
+          auto shapeInfo = ArrayAttr::get(funcOp.getContext(), symbols);
           arg.setType(RankedTensorType::get(
               rankedType.getShape(), rankedType.getElementType(), shapeInfo));
         }

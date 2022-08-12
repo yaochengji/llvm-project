@@ -51,7 +51,8 @@ std::unique_ptr<OperationPass<func::FuncOp>> createRemoveShapeConstraintsPass();
 // level.
 std::unique_ptr<OperationPass<func::FuncOp>> createShapeBufferizePass();
 
-std::unique_ptr<OperationPass<ModuleOp>> createOutlineShapeComputationPass();
+std::unique_ptr<OperationPass<ModuleOp>>
+createOutlineShapeComputationPass(const std::string &entryFunc = "");
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createInsertDimensionSymbolsPass(const std::string &entryFunc = "");

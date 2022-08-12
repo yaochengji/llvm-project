@@ -237,12 +237,11 @@ private:
   DenseMap<Operation *, bool> onlyUsedByWithShapes_;
 };
 
-class TensorDimOpConverter : public OpConversionPattern<tensor::DimOp> {
-  using OpConversionPattern<tensor::DimOp>::OpConversionPattern;
+class TensorDimOpRewriter : public OpRewritePattern<tensor::DimOp> {
+  using OpRewritePattern<tensor::DimOp>::OpRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(tensor::DimOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(tensor::DimOp op,
+                                PatternRewriter &rewriter) const override {
     auto shapeOf =
         rewriter.create<shape::ShapeOfOp>(op.getLoc(), op.getSource());
     rewriter.replaceOpWithNewOp<shape::GetExtentOp>(op, op.getType(), shapeOf,
@@ -254,21 +253,22 @@ class TensorDimOpConverter : public OpConversionPattern<tensor::DimOp> {
 void OutlineShapeComputationPass::runOnOperation() {
   ModuleOp moduleOp = getOperation();
   SymbolTable symbolTable(moduleOp);
-  MLIRContext *context = moduleOp.getContext();
 
   moduleOp.walk([&](func::FuncOp funcOp) {
     if (funcOp.getName() != entryFunc)
       return;
 
-    RewritePatternSet prevPatterns(context);
-    prevPatterns.add<TensorDimOpConverter>(context);
-    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(prevPatterns)))) {
-      return signalPassFailure();
-    }
+    MLIRContext *context = funcOp.getContext();
+    // RewritePatternSet prevPatterns(context);
+    // prevPatterns.insert<TensorDimOpRewriter>(context);
+    // if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(prevPatterns)))) {
+    //   return signalPassFailure();
+    // }
 
     // initialize class member \p onlyUsedByWithShapes_
     onlyUsedByWithShapes_.clear();
-    funcOp.walk([&](Operation *op) { calOnlyUsedByWithShapesRecursively(op); });
+    funcOp.walk([&](Operation *op) { calOnlyUsedByWithShapesRecursively(op);
+    });
 
     // collect all the shape.with_shape ops.
     std::vector<shape::WithOp> allWithOps;

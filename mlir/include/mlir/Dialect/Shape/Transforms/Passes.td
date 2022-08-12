@@ -25,6 +25,11 @@ def InsertDimensionSymbols : Pass<"insert-dimension-symbols", "ModuleOp"> {
 def OutlineShapeComputation : Pass<"outline-shape-computation", "ModuleOp"> {
   let summary = "Using shape.func to preserve shape computation.";
   let constructor = "mlir::createOutlineShapeComputationPass()";
+  let options = [
+    Option<"entryFunc", "entry-func", "std::string",
+            /*default=*/"\"main\"",
+            "Used to specify the entry-function.">,
+  ];
   let dependentDialects = ["shape::ShapeDialect"];
 }
 
