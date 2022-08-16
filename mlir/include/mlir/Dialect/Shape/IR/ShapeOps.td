@@ -639,6 +639,20 @@ def Shape_ShapeOfOp : Shape_Op<"shape_of",
   }];
 }
 
+def Shape_ValueOfOp : Shape_Op<"value_of", [NoSideEffect]> {
+  let summary = "Returns value of a !shape.value_shape operand";
+
+   let description = [{
+    The operation takes !shape.value_shape as an argument and it returns a
+    tensor, which represents the value of (value, shape) tuple of the argument.
+  }];
+
+  let arguments = (ins Shape_ValueShapeType:$arg);
+  let results = (outs AnyShaped:$result);
+
+  let assemblyFormat = "$arg attr-dict `:` type($result)";
+}
+
 def Shape_SizeToIndexOp : Shape_Op<"size_to_index", [
     DeclareOpInterfaceMethods<CastOpInterface>, NoSideEffect
   ]> {
