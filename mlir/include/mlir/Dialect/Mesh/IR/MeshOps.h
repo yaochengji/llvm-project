@@ -27,17 +27,9 @@
 namespace mlir {
 namespace mesh {
 
-bool isReductionLoop(IteratorType iType) {
-  return iType != IteratorType::Parallel && iType != IteratorType::Invalid;
-}
+bool isReductionLoop(IteratorType iType);
 
-bool areReductionAndPartialMatch(IteratorType iType, Partial partial) {
-  return (partial == Partial::Generic &&
-          iType == IteratorType::ReductionGeneric) ||
-         (partial == Partial::Sum && iType == IteratorType::ReductionSum) ||
-         (partial == Partial::Max && iType == IteratorType::ReductionMax) ||
-         (partial == Partial::Min && iType == IteratorType::ReductionMin);
-}
+bool areReductionAndPartialMatch(IteratorType iType, Partial partial);
 
 template <typename T>
 void removeTrailingEmptySubArray(SmallVector<SmallVector<T>> &array) {
@@ -49,20 +41,7 @@ void removeTrailingEmptySubArray(SmallVector<SmallVector<T>> &array) {
   }
 }
 
-Partial getPartialTypeFromReduction(IteratorType iType) {
-  switch (iType) {
-  case IteratorType::ReductionGeneric:
-    return Partial::Generic;
-  case IteratorType::ReductionSum:
-    return Partial::Sum;
-  case IteratorType::ReductionMax:
-    return Partial::Max;
-  case IteratorType::ReductionMin:
-    return Partial::Min;
-  default:
-    assert(0 && "No corresponding partial type can be found");
-  }
-}
+Partial getPartialTypeFromReduction(IteratorType iType);
 
 } // namespace mesh
 } // namespace mlir
