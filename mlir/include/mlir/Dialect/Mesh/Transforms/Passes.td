@@ -29,4 +29,18 @@ def ShardingPropagation : Pass<"sharding-propagation", "mlir::func::FuncOp"> {
   ];
 }
 
+//===----------------------------------------------------------------------===//
+// SpmdPartition
+//===----------------------------------------------------------------------===//
+
+def SpmdPartition : Pass<"spmd-partition", "mlir::func::FuncOp"> {
+  let summary = "spmd partition";
+  let description = [{
+    TODO
+  }];
+  let dependentDialects = [
+    "mesh::MeshDialect"
+  ];
+}
+
 #endif // MLIR_DIALECT_MESH_TRANSFORMS_PASSES_TD

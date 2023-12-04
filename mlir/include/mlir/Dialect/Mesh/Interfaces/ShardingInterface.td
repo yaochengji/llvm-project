@@ -88,6 +88,24 @@ def ShardingInterface : OpInterface<"ShardingInterface"> {
           return detail::defaultAddShardingAnnotations(
             $_op.getOperation(), b, shardingOption);
         }]
+      >,
+      InterfaceMethod<
+        /*desc=*/[{
+          Convert to spmd foramt
+        }],
+        /*retTy=*/"LogicalResult",
+        /*methodName=*/"spmdPartition",
+        /*args=*/(ins
+          "OpBuilder &":$b,
+          "ArrayRef<MeshShardingAttr>": $operandShardings,
+          "ArrayRef<MeshShardingAttr>": $resultShardings,
+          "SymbolTableCollection &": $symbolTable
+        ),
+        /*methodBody=*/"",
+        /*defaultImplementation=*/[{
+          return detail::defaultSpmdPartition(
+            $_op.getOperation(), b, operandShardings, resultShardings, symbolTable);
+        }]
       >
     ];
 

@@ -65,29 +65,14 @@ static bool isMeshDimensionDynamic(DimSize size) {
 
 using MeshAxis = int16_t;
 
-namespace {
-
-struct DimensionSize {
-  static DimensionSize dynamic() { return DimensionSize(ShapedType::kDynamic); }
-  DimensionSize(int64_t val) : val(val) {}
-  int64_t value() const { return val; }
-  operator int64_t() const { return val; }
-  bool isDynamic() const { return ShapedType::isDynamic(val); }
-
-private:
-  int64_t val;
-};
-
-} // namespace
-
-static DimensionSize operator/(DimensionSize lhs, DimensionSize rhs) {
-  if (lhs.isDynamic() || rhs.isDynamic()) {
+DimensionSize mesh::operator/(DimensionSize lhs, DimensionSize rhs) {
+  if (lhs.isDynamic() || rhs.isDynamic() || rhs.value() == 0) {
     return DimensionSize::dynamic();
   }
   return lhs.value() / rhs.value();
 }
 
-static DimensionSize operator*(DimensionSize lhs, DimensionSize rhs) {
+DimensionSize mesh::operator*(DimensionSize lhs, DimensionSize rhs) {
   if (lhs.isDynamic() || rhs.isDynamic()) {
     return DimensionSize::dynamic();
   }
@@ -182,7 +167,8 @@ SmallVector<int64_t> ClusterOp::canonicalDimSizes() {
 
 LogicalResult
 MeshShardingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
-                         SymbolRefAttr, ArrayRef<DenseI32ArrayAttr> splitAxes,
+                         FlatSymbolRefAttr,
+                         ArrayRef<DenseI32ArrayAttr> splitAxes,
                          ArrayRef<int32_t> partialAxes, Partial) {
   // TODO: At present cluster symbol ref is not verified. This is due to the
   // difficulty in fetching the corresponding symbol op based on an attribute.
@@ -236,8 +222,8 @@ struct EmptyMeshAxesCanonicalizationPattern : OpRewritePattern<Op> {
 
 } // namespace
 
-static FailureOr<ClusterOp> getMesh(Operation *op, FlatSymbolRefAttr meshSymbol,
-                                    SymbolTableCollection &symbolTable) {
+FailureOr<ClusterOp> mesh::getMesh(Operation *op, FlatSymbolRefAttr meshSymbol,
+                                   SymbolTableCollection &symbolTable) {
   mesh::ClusterOp mesh =
       symbolTable.lookupNearestSymbolFrom<mesh::ClusterOp>(op, meshSymbol);
   if (!mesh) {

@@ -28,7 +28,25 @@
 #include "mlir/Dialect/Mesh/IR/MeshOps.h.inc"
 
 namespace mlir {
+
+class SymbolTableCollection;
+
 namespace mesh {
+
+struct DimensionSize {
+  static DimensionSize dynamic() { return DimensionSize(ShapedType::kDynamic); }
+  DimensionSize(int64_t val) : val(val) {}
+  int64_t value() const { return val; }
+  operator int64_t() const { return val; }
+  bool isDynamic() const { return ShapedType::isDynamic(val); }
+
+private:
+  int64_t val;
+};
+
+DimensionSize operator/(DimensionSize lhs, DimensionSize rhs);
+
+DimensionSize operator*(DimensionSize lhs, DimensionSize rhs);
 
 bool isReductionLoop(IteratorType iType);
 
@@ -41,6 +59,9 @@ void removeTrailingEmptySubArray(SmallVector<SmallVector<T>> &array) {
 }
 
 Partial getPartialTypeFromReduction(IteratorType iType);
+
+FailureOr<ClusterOp> getMesh(Operation *op, FlatSymbolRefAttr meshSymbol,
+                             SymbolTableCollection &symbolTable);
 
 } // namespace mesh
 } // namespace mlir

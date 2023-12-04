@@ -10,11 +10,13 @@
 #include "mlir/Dialect/Mesh/IR/MeshOps.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
+#include <numeric>
 #include <utility>
 
 #define DEBUG_TYPE "sharding-interface"
@@ -215,7 +217,7 @@ namespace {
 // Update the given `shardingOption` according to `meshAxes` and `loopIdx`
 static LogicalResult fillShardingOption(Operation *op,
                                         ShardingOption &shardingOption,
-                                        SymbolRefAttr cluster,
+                                        FlatSymbolRefAttr cluster,
                                         ArrayRef<int32_t> meshAxes,
                                         unsigned loopIdx) {
   if ((shardingOption.cluster && cluster &&
@@ -519,6 +521,149 @@ LogicalResult mesh::detail::defaultAddShardingAnnotations(
     if (failed(addShardOp(b, opOperand, shardingOption,
                           maps[opOperand.getOperandNumber()], loopTypes)))
       return failure();
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// detail::defaultSpmdPartition
+//===----------------------------------------------------------------------===//
+
+LogicalResult static verifySpmdPartitionArguments(
+    Operation *op, ArrayRef<MeshShardingAttr> operandShardings,
+    ArrayRef<MeshShardingAttr> resultShardings) {
+  // check non-null
+  if (llvm::any_of(operandShardings,
+                   [](MeshShardingAttr attr) { return !attr; }))
+    return op->emitError()
+           << "all the operand shardings are expected to be non-null";
+
+  if (llvm::any_of(resultShardings,
+                   [](MeshShardingAttr attr) { return !attr; }))
+    return op->emitError()
+           << "all the result shardings are expected to be non-null";
+
+  // check same cluster symbol
+  FlatSymbolRefAttr cluster;
+  auto checkCluster = [&](FlatSymbolRefAttr curCluster) {
+    if (!curCluster)
+      return failure();
+
+    if (!cluster)
+      cluster = curCluster;
+    else if (curCluster != cluster)
+      return failure();
+
+    return success();
+  };
+
+  if (llvm::any_of(operandShardings, [&](MeshShardingAttr attr) {
+        return failed(checkCluster(attr.getCluster()));
+      }))
+    return op->emitError()
+           << "all the operand and result shardings are expected to have "
+              "the same cluster symbol ref";
+
+  if (llvm::any_of(resultShardings, [&](MeshShardingAttr attr) {
+        return failed(checkCluster(attr.getCluster()));
+      }))
+    return op->emitError()
+           << "all the operand and result shardings are expected to have "
+              "the same cluster symbol ref";
+
+  // check all RankedTensorType
+  if (llvm::any_of(op->getOperandTypes(), [&](Type type) {
+        return !llvm::isa<RankedTensorType>(type);
+      }))
+    return op->emitError()
+           << "all the operand types are expected to be RankedTensorType";
+  if (llvm::any_of(op->getResultTypes(), [&](Type type) {
+        return !llvm::isa<RankedTensorType>(type);
+      }))
+    return op->emitError()
+           << "all the result types are expected to be RankedTensorType";
+
+  return success();
+}
+
+static SmallVector<DimensionSize>
+getGroupSizes(MeshShardingAttr shardingAttr,
+              ArrayRef<DimensionSize> clusterShape) {
+  ArrayRef<DenseI32ArrayAttr> splitAxes = shardingAttr.getSplitAxes();
+  SmallVector<DimensionSize> groupSizes;
+  groupSizes.reserve(clusterShape.size());
+  for (DenseI32ArrayAttr splitAxis : splitAxes) {
+    SmallVector<DimensionSize> array =
+        llvm::map_to_vector(splitAxis.asArrayRef(),
+                            [&](int32_t axis) { return clusterShape[axis]; });
+    groupSizes.push_back(std::accumulate(array.begin(), array.end(),
+                                         DimensionSize(1),
+                                         std::multiplies<DimensionSize>()));
+  }
+  groupSizes.append(clusterShape.size() - splitAxes.size(), DimensionSize(1));
+  return groupSizes;
+}
+
+static RankedTensorType getNewType(MeshShardingAttr shardingAttr,
+                                   ArrayRef<DimensionSize> clusterShape,
+                                   RankedTensorType oldType) {
+  SmallVector<DimensionSize> groupSizes =
+      getGroupSizes(shardingAttr, clusterShape);
+  SmallVector<DimensionSize> oldShape =
+      llvm::map_to_vector(oldType.getShape(), [](int64_t dimSize) {
+        return DimensionSize(dimSize);
+      });
+  SmallVector<int64_t> newShape;
+  newShape.reserve(oldShape.size());
+  for (auto it : llvm::zip(oldShape, groupSizes)) {
+    DimensionSize dimSize = std::get<0>(it) / std::get<1>(it);
+    newShape.push_back(dimSize.value());
+  }
+  return oldType.clone(newShape);
+}
+
+LogicalResult
+mesh::detail::defaultSpmdPartition(Operation *op, OpBuilder &b,
+                                   ArrayRef<MeshShardingAttr> operandShardings,
+                                   ArrayRef<MeshShardingAttr> resultShardings,
+                                   SymbolTableCollection &symbolTable) {
+  LogicalResult verifiedResult =
+      verifySpmdPartitionArguments(op, operandShardings, resultShardings);
+  if (failed(verifiedResult))
+    return verifiedResult;
+
+  if (operandShardings.size() == 0 && resultShardings.size() == 0)
+    return success();
+  FlatSymbolRefAttr clusterSymbolRef = operandShardings.size() > 0
+                                           ? operandShardings[0].getCluster()
+                                           : resultShardings[0].getCluster();
+  FailureOr<ClusterOp> clusterOp = getMesh(op, clusterSymbolRef, symbolTable);
+  if (failed(clusterOp))
+    return op->emitError() << "No corresponding mesh.cluster op found";
+
+  SmallVector<DimensionSize> clusterShape =
+      llvm::map_to_vector(clusterOp->getDimSizes(), [](int64_t dimSize) {
+        return DimensionSize(dimSize);
+      });
+  clusterShape.append(clusterOp->getRank() - clusterShape.size(),
+                      DimensionSize::dynamic());
+
+  SmallVector<RankedTensorType> newOperandTypes;
+  SmallVector<RankedTensorType> newResultTypes;
+  newOperandTypes.reserve(operandShardings.size());
+  newResultTypes.reserve(resultShardings.size());
+
+  for (size_t i = 0; i < operandShardings.size(); ++i) {
+    auto oldType = op->getOperand(i).getType().cast<RankedTensorType>();
+    newOperandTypes.push_back(
+        getNewType(operandShardings[i], clusterShape, oldType));
+  }
+
+  for (size_t i = 0; i < resultShardings.size(); ++i) {
+    auto oldType = op->getResult(i).getType().cast<RankedTensorType>();
+    newOperandTypes.push_back(
+        getNewType(resultShardings[i], clusterShape, oldType));
   }
 
   return success();
