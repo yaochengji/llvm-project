@@ -29,11 +29,34 @@ using namespace mlir::mesh;
 
 namespace {
 
+LogicalResult visitOp(Operation *op, OpBuilder &builder) {
+  if (llvm::isa<ShardOp>(op))
+    return success(); 
+  
+  SmallVector<MeshShardingAttr> operandShardings;
+  SmallVector<MeshShardingAttr> resultShardings;
+}
+
 //===----------------------------------------------------------------------===//
 // SpmdPartition
 //===----------------------------------------------------------------------===//
 struct SpmdPartition : public mesh::impl::SpmdPartitionBase<SpmdPartition> {
-  void runOnOperation() override {}
+  void runOnOperation() override {
+    func::FuncOp funcOp = getOperation();
+    MLIRContext *ctx = funcOp.getContext();
+    Region &region = funcOp.getBody();
+    OpBuilder builder(ctx);
+    if (!region.hasOneBlock()) {
+      funcOp.emitOpError() << "only one block is supported!";
+      return signalPassFailure();
+    }
+    Block &block = region.front();
+
+    for (Operation &op : llvm::make_early_inc_range(llvm::reverse(block))) {
+      if (failed(visitOp(&op, builder)))
+        return signalPassFailure();
+    }
+  }
 };
 
 } // namespace
